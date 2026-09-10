@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -516,22 +517,44 @@ class BackupAttachmentResolver:
 DEFAULT_USB_CACHE = Path.home() / ".cache" / "textdownloadmac" / "backup"
 
 _INSTALL_HINT = (
-    "No iOS backup driver found on PATH. Install one of:\n"
-    "  Option A — pip (no Homebrew required, actively maintained):\n"
+    "No iOS backup driver found. Install one of:\n"
+    "  Option A — pip (recommended, no Homebrew needed):\n"
     "      python3 -m pip install --user pymobiledevice3\n"
+    "    This tool invokes it as `python3 -m pymobiledevice3 ...`, so it\n"
+    "    works even if the user-scripts directory isn't on your PATH.\n"
     "  Option B — Homebrew:\n"
     "      brew install libimobiledevice\n"
     "    If the stable formula fails to build on your macOS, try HEAD:\n"
-    "      brew install --HEAD libimobiledevice\n"
-    "    or grab a maintained tap:\n"
-    "      brew tap libimobiledevice-glue/libimobiledevice-glue\n"
     "      brew install --HEAD libimobiledevice\n"
     "Then rerun with --via-usb."
 )
 
 
+def _pymobiledevice3_module_available() -> bool:
+    """Is pymobiledevice3 importable from the current interpreter?
+
+    We look up the module spec instead of importing to avoid loading it
+    (and its heavy transitive deps) into our process.
+    """
+    try:
+        return importlib.util.find_spec("pymobiledevice3") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def find_backup_driver() -> Optional[str]:
-    """Return the name of the first backup CLI found on PATH, else None."""
+    """Return a driver identifier for whichever backup tool is available.
+
+    Preference order:
+      1. "pymobiledevice3-module" — installed as a Python package for
+         THIS interpreter. Invoked as `sys.executable -m pymobiledevice3`,
+         which works even if pip's user-scripts bin isn't on PATH (a
+         very common macOS situation after `pip install --user`).
+      2. "pymobiledevice3" — its CLI script is on PATH.
+      3. "idevicebackup2" — libimobiledevice's CLI on PATH.
+    """
+    if _pymobiledevice3_module_available():
+        return "pymobiledevice3-module"
     if shutil.which("pymobiledevice3"):
         return "pymobiledevice3"
     if shutil.which("idevicebackup2"):
@@ -544,10 +567,22 @@ def libimobiledevice_error() -> Optional[str]:
     return None if find_backup_driver() is not None else _INSTALL_HINT
 
 
-def _udid_from_pymobiledevice3() -> Optional[str]:
+def _pymobiledevice3_argv_prefix(driver: str) -> Optional[list[str]]:
+    """The command prefix for whichever pymobiledevice3 flavor is active."""
+    if driver == "pymobiledevice3-module":
+        return [sys.executable, "-m", "pymobiledevice3"]
+    if driver == "pymobiledevice3":
+        return ["pymobiledevice3"]
+    return None
+
+
+def _udid_from_pymobiledevice3(driver: str) -> Optional[str]:
+    prefix = _pymobiledevice3_argv_prefix(driver)
+    if prefix is None:
+        return None
     try:
         p = subprocess.run(
-            ["pymobiledevice3", "usbmux", "list"],
+            prefix + ["usbmux", "list"],
             capture_output=True,
             text=True,
             timeout=15,
@@ -594,10 +629,19 @@ def _udid_from_idevice_id() -> Optional[str]:
 def connected_iphone_udid() -> Optional[str]:
     """Return the UDID of a USB-attached iPhone via whichever driver is present."""
     driver = find_backup_driver()
-    if driver == "pymobiledevice3":
-        return _udid_from_pymobiledevice3() or _udid_from_idevice_id()
+    if driver in ("pymobiledevice3-module", "pymobiledevice3"):
+        return (
+            _udid_from_pymobiledevice3(driver)
+            or _udid_from_idevice_id()
+        )
     if driver == "idevicebackup2":
-        return _udid_from_idevice_id() or _udid_from_pymobiledevice3()
+        # Prefer libimobiledevice's own idevice_id here; only fall back to
+        # pymobiledevice3 if one is around too.
+        return (
+            _udid_from_idevice_id()
+            or _udid_from_pymobiledevice3("pymobiledevice3-module")
+            or _udid_from_pymobiledevice3("pymobiledevice3")
+        )
     return None
 
 
@@ -610,8 +654,11 @@ def _build_backup_command(
             cmd += ["--udid", udid]
         cmd.append(str(target_root))
         return cmd
-    # pymobiledevice3
-    cmd = ["pymobiledevice3", "backup2", "backup"]
+    # pymobiledevice3 — module or PATH script; same argv shape
+    prefix = _pymobiledevice3_argv_prefix(driver)
+    if prefix is None:
+        raise RuntimeError(f"Unknown backup driver: {driver}")
+    cmd = prefix + ["backup2", "backup"]
     if udid:
         cmd += ["--udid", udid]
     cmd.append(str(target_root))
@@ -639,8 +686,9 @@ def run_usb_backup(target_root: Path, udid: Optional[str]) -> Path:
     )
     result = subprocess.run(cmd)
     if result.returncode != 0:
+        pretty = "pymobiledevice3" if driver.startswith("pymobiledevice3") else driver
         raise RuntimeError(
-            f"{driver} exited with status {result.returncode}. "
+            f"{pretty} exited with status {result.returncode}. "
             "Common causes: the phone is locked, 'Trust This Computer' "
             "hasn't been tapped, or backup encryption is enabled on the "
             "phone (which this tool cannot decrypt)."

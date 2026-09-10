@@ -153,7 +153,9 @@ python3 textdownload.py --no-backup --phone 5551234567
 python3 textdownload.py --list-backups
 
 # Back up over USB right now (deletes backup at end of run)
-python3 -m pip install --user pymobiledevice3    # one-time; recommended
+# pymobiledevice3 is already installed from requirements.txt; if you
+# skipped that step:
+#   python3 -m pip install --user pymobiledevice3
 python3 textdownload.py --via-usb --phone 5551234567
 
 # Or, if you prefer Homebrew:
@@ -185,24 +187,23 @@ what's stored.
 ## If `brew install libimobiledevice` fails
 
 The Homebrew formula for libimobiledevice sometimes lags behind macOS
-releases and fails to build. Two workarounds, in order of preference:
+releases and fails to build. You don't need Homebrew at all —
+`pymobiledevice3` is a pip-installable, actively maintained equivalent
+that this tool prefers when it's present:
 
-1. **Skip Homebrew and use `pymobiledevice3`.** It's pip-installable,
-   actively maintained, and this tool auto-detects it:
+```
+python3 -m pip install --user -r requirements.txt
+python3 textdownload.py --via-usb --phone 5551234567
+```
 
-   ```
-   python3 -m pip install --user pymobiledevice3
-   python3 textdownload.py --via-usb --phone 5551234567
-   ```
+You may see pip warn that the user-scripts directory isn't on your
+PATH — that's fine. This tool invokes `pymobiledevice3` as a Python
+module (`python3 -m pymobiledevice3 ...`), which works regardless of
+whether the CLI script is on PATH.
 
-2. **Try the HEAD build** if you still want the Homebrew route:
-
-   ```
-   brew install --HEAD libimobiledevice
-   ```
-
-Both drivers speak the same iOS backup protocol; the tool works with
-either one.
+If you still want the Homebrew route, `brew install --HEAD libimobiledevice`
+usually succeeds where the stable formula fails. Both drivers speak
+the same iOS backup protocol; the tool works with either one.
 
 ## Notes and limits
 
