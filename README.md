@@ -7,23 +7,43 @@ chat that includes the number are included, each in its own section.
 
 ## Sources it can read
 
-The tool understands two sources and picks between them automatically:
+The tool understands three sources:
 
 1. **Mac's live Messages database** at `~/Library/Messages/chat.db`.
    Works when Messages on the Mac is signed in with the same Apple ID
    as your iPhone (or SMS Forwarding is on) so threads are mirrored
    there. Requires **Full Disk Access** for your terminal.
 
-2. **iPhone Finder backup** at
+2. **Existing iPhone Finder backup** at
    `~/Library/Application Support/MobileSync/Backup/<UDID>/`.
    Used when the phone is only USB-plugged into the Mac and NOT signed
    in to the same Messages account. The tool reads `Manifest.db`,
    extracts `sms.db`, and pulls image attachments out of the backup on
    demand. Does not require Full Disk Access.
 
-**Default flow:** try the Mac database first; if it has no matching
-handle for the requested number, automatically fall back to the latest
-local iPhone backup.
+3. **`--via-usb`** — trigger a backup right now over the USB cable, no
+   Finder clicks. Uses libimobiledevice's `idevicebackup2` under the
+   hood. By default the backup goes into a temp directory that is
+   deleted at the end of the run, so nothing is left on the Mac. Pass
+   `--usb-cache PATH` to keep an incremental cache directory so future
+   runs pull only what has changed (much faster after the first run).
+
+**Default flow (no --via-usb):** try the Mac database first; if it has
+no matching handle for the requested number, automatically fall back
+to the latest local iPhone backup already on disk.
+
+### Why USB requires a backup at all
+
+Apple deliberately does not expose the Messages database (`sms.db`)
+over USB except through the `com.apple.mobilebackup2` service, which
+is exactly what Finder uses to make a backup. Every third-party tool
+that reads iMessage/SMS off a non-jailbroken iPhone — iMazing,
+iExplorer, libimobiledevice — talks to that same service. There is no
+"only pull sms.db" API; the initial transfer is always a full backup.
+`--via-usb` automates that transfer and cleans up after itself; it
+does not sidestep the transfer. If you want to avoid the full copy
+entirely, sign in to Messages on this Mac with your Apple ID (option
+1) so the threads arrive via iCloud sync instead.
 
 The exported PDF contains:
 
@@ -128,6 +148,13 @@ python3 textdownload.py --no-backup --phone 5551234567
 
 # List the backups this Mac has and exit
 python3 textdownload.py --list-backups
+
+# Back up over USB right now (deletes backup at end of run)
+brew install libimobiledevice          # one-time
+python3 textdownload.py --via-usb --phone 5551234567
+
+# Same, but keep an incremental cache for fast repeat runs
+python3 textdownload.py --via-usb --usb-cache ~/.cache/textdownloadmac/backup --phone 5551234567
 
 # Custom output filename
 python3 textdownload.py --phone 5551234567 --output thread.pdf

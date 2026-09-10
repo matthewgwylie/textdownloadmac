@@ -2,7 +2,7 @@
 """
 textdownload — Export iPhone Messages conversations with a contact to a PDF.
 
-Two sources are supported and the tool auto-picks between them:
+Three sources are supported:
 
   1. The Mac's live Messages database (~/Library/Messages/chat.db).
      Useful when Messages on the Mac is signed in with the same Apple ID
@@ -16,8 +16,16 @@ Two sources are supported and the tool auto-picks between them:
      Manifest.db, extracts sms.db (and pulls image attachments out of
      the backup on demand).
 
-Default behavior: try the Mac database; if no messages match the
-contact, automatically fall back to the latest local iPhone backup.
+  3. --via-usb: trigger a backup over USB using libimobiledevice's
+     idevicebackup2 (brew install libimobiledevice). iOS only exposes
+     sms.db through the backup service, so this still transfers a
+     backup, but by default we back up into a temp directory that is
+     deleted when the run ends. Pass --usb-cache PATH to keep an
+     incremental cache so subsequent runs pull only changed files.
+
+Default behavior (no --via-usb): try the Mac database; if no messages
+match the contact, automatically fall back to the latest local iPhone
+backup already on disk.
 
 The exported PDF contains:
   - A "Direct Conversation" section with the 1:1 thread(s) for the number.
@@ -34,7 +42,9 @@ Usage:
     python3 textdownload.py --phone +15551234567
     python3 textdownload.py --phone 5551234567 --output thread.pdf
     python3 textdownload.py --list-backups            # show phones you've backed up
-    python3 textdownload.py --use-backup --phone ...  # force reading from backup
+    python3 textdownload.py --use-backup --phone ...  # force reading from existing backup
+    python3 textdownload.py --via-usb --phone ...     # back up over USB (deletes after)
+    python3 textdownload.py --via-usb --usb-cache ~/.cache/textdownloadmac/backup --phone ...
 
 Reading chat.db requires Full Disk Access for the terminal running
 this script (System Settings -> Privacy & Security -> Full Disk Access).
@@ -54,6 +64,7 @@ import plistlib
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -490,6 +501,97 @@ class BackupAttachmentResolver:
             return dest
         self._cache[filename] = None
         return None
+
+
+# --- USB-triggered backup via libimobiledevice --------------------------
+
+# iOS does NOT expose sms.db over USB in any way except through the
+# backup service (com.apple.mobilebackup2). libimobiledevice's
+# `idevicebackup2` command speaks that same protocol, so we can trigger
+# a backup from the CLI without opening Finder and point it at whatever
+# directory we like — a session-scoped temp dir (backup discarded after
+# reading sms.db) or a persistent cache dir (subsequent runs are
+# incremental and pull only changed files).
+
+DEFAULT_USB_CACHE = Path.home() / ".cache" / "textdownloadmac" / "backup"
+
+
+def libimobiledevice_error() -> Optional[str]:
+    """Return None if idevicebackup2 is available, else an error string."""
+    if shutil.which("idevicebackup2") is None:
+        return (
+            "idevicebackup2 is not installed. Install libimobiledevice:\n"
+            "    brew install libimobiledevice\n"
+            "then rerun with --via-usb."
+        )
+    if shutil.which("idevice_id") is None:
+        return (
+            "idevice_id is not on PATH — libimobiledevice seems partially\n"
+            "installed. Try:  brew reinstall libimobiledevice"
+        )
+    return None
+
+
+def connected_iphone_udid() -> Optional[str]:
+    """Return the UDID of a USB-attached iPhone, if any is paired and awake."""
+    try:
+        p = subprocess.run(
+            ["idevice_id", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    lines = [line.strip() for line in p.stdout.splitlines() if line.strip()]
+    return lines[0] if lines else None
+
+
+def run_usb_backup(target_root: Path, udid: Optional[str]) -> Path:
+    """Trigger `idevicebackup2 backup` into target_root and return the
+    backup's <UDID>/ subdirectory.
+
+    target_root is passed to idevicebackup2 unchanged; the tool creates
+    (or reuses) target_root/<UDID>/ inside it. On the first backup this
+    pulls the entire phone; on subsequent runs against the same
+    target_root it's incremental.
+    """
+    target_root.mkdir(parents=True, exist_ok=True)
+    cmd = ["idevicebackup2", "backup"]
+    if udid:
+        cmd += ["--udid", udid]
+    cmd.append(str(target_root))
+    print(
+        "Running: " + " ".join(cmd),
+        file=sys.stderr,
+    )
+    print(
+        "  (First backup pulls the entire phone — this can take a while. "
+        "Subsequent runs against the same directory are incremental.)",
+        file=sys.stderr,
+    )
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"idevicebackup2 exited with status {result.returncode}. "
+            "Common causes: the phone is locked, 'Trust This Computer' "
+            "hasn't been tapped, or backup encryption is enabled on the "
+            "phone (turn it off in Finder or accept an encrypted backup "
+            "that this tool cannot decrypt)."
+        )
+    candidates = [
+        d for d in target_root.iterdir()
+        if d.is_dir() and (d / "Manifest.plist").exists()
+    ]
+    if not candidates:
+        raise RuntimeError(
+            f"Backup completed but no <UDID>/Manifest.plist found under "
+            f"{target_root}."
+        )
+    candidates.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    return candidates[0]
 
 
 # --- end iPhone backup support ------------------------------------------
@@ -1034,6 +1136,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="List iPhone backups this Mac has and exit.",
     )
+    parser.add_argument(
+        "--via-usb",
+        action="store_true",
+        help=(
+            "Trigger a backup over USB via libimobiledevice's idevicebackup2 "
+            "and read messages from it. iOS does not expose sms.db any other "
+            "way, so this still transfers a backup; combine with --usb-cache "
+            "to keep future runs incremental, or accept the default (temp "
+            "directory that is deleted when the run ends)."
+        ),
+    )
+    parser.add_argument(
+        "--usb-cache",
+        type=Path,
+        help=(
+            "For --via-usb: directory to keep the backup in so subsequent "
+            "runs are incremental. Default: no cache (backup is stored in "
+            "a temp directory that is deleted at the end of the run). Pass "
+            f"e.g. {DEFAULT_USB_CACHE} to make future runs fast."
+        ),
+    )
+    parser.add_argument(
+        "--udid",
+        help="Specific iPhone UDID for --via-usb (only useful if multiple "
+             "iPhones are attached).",
+    )
     args = parser.parse_args(argv)
 
     if args.list_backups:
@@ -1053,7 +1181,57 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         try:
             # -------- Decide the initial source --------
-            if args.backup_path:
+            if args.via_usb:
+                err = libimobiledevice_error()
+                if err:
+                    print(err, file=sys.stderr)
+                    return 1
+                udid = args.udid or connected_iphone_udid()
+                if not udid:
+                    print(
+                        "No USB-attached iPhone found. Plug in your iPhone, "
+                        "unlock it, and tap 'Trust This Computer' if prompted, "
+                        "then retry.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                # Cache dir: persistent if --usb-cache given (incremental
+                # backup), else a scratch dir inside tmpdir that goes away
+                # when this run ends.
+                if args.usb_cache:
+                    target_root = args.usb_cache.expanduser()
+                    print(
+                        f"Using persistent backup cache: {target_root}",
+                        file=sys.stderr,
+                    )
+                else:
+                    target_root = tmpdir / "usb_backup"
+                    print(
+                        "Backup will be discarded when this run ends "
+                        "(pass --usb-cache PATH to keep it and make future "
+                        "runs incremental).",
+                        file=sys.stderr,
+                    )
+                try:
+                    backup_dir = run_usb_backup(target_root, udid)
+                except RuntimeError as e:
+                    print(str(e), file=sys.stderr)
+                    return 1
+                info = _read_backup_metadata(backup_dir)
+                if info["encrypted"]:
+                    print(
+                        "The backup came off the phone encrypted (this is "
+                        "controlled on the phone via Finder's 'Encrypt local "
+                        "backup' setting). textdownload cannot decrypt "
+                        "encrypted backups — turn that setting off in Finder "
+                        "and rerun with --via-usb.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                conn, resolve_attachment, source_label, backup_resolver = (
+                    _open_source_from_backup(info, tmpdir)
+                )
+            elif args.backup_path:
                 backup_dir = args.backup_path
                 if not backup_dir.exists():
                     print(f"Backup path does not exist: {backup_dir}", file=sys.stderr)
