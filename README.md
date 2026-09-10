@@ -22,9 +22,12 @@ The tool understands three sources:
    demand. Does not require Full Disk Access.
 
 3. **`--via-usb`** — trigger a backup right now over the USB cable, no
-   Finder clicks. Uses libimobiledevice's `idevicebackup2` under the
-   hood. By default the backup goes into a temp directory that is
-   deleted at the end of the run, so nothing is left on the Mac. Pass
+   Finder clicks. Uses whichever of these is installed:
+   - `pymobiledevice3` (pip, no Homebrew needed — recommended)
+   - `idevicebackup2` from libimobiledevice (Homebrew)
+
+   By default the backup goes into a temp directory that is deleted at
+   the end of the run, so nothing is left on the Mac. Pass
    `--usb-cache PATH` to keep an incremental cache directory so future
    runs pull only what has changed (much faster after the first run).
 
@@ -150,8 +153,12 @@ python3 textdownload.py --no-backup --phone 5551234567
 python3 textdownload.py --list-backups
 
 # Back up over USB right now (deletes backup at end of run)
-brew install libimobiledevice          # one-time
+python3 -m pip install --user pymobiledevice3    # one-time; recommended
 python3 textdownload.py --via-usb --phone 5551234567
+
+# Or, if you prefer Homebrew:
+#   brew install libimobiledevice
+# (If that fails on your macOS, try `brew install --HEAD libimobiledevice`.)
 
 # Same, but keep an incremental cache for fast repeat runs
 python3 textdownload.py --via-usb --usb-cache ~/.cache/textdownloadmac/backup --phone 5551234567
@@ -174,6 +181,28 @@ If the tool can't find a matching handle it prints:
 That tells you whether the source is empty (typical: Mac chat.db when
 your phone isn't synced) versus the number genuinely differing from
 what's stored.
+
+## If `brew install libimobiledevice` fails
+
+The Homebrew formula for libimobiledevice sometimes lags behind macOS
+releases and fails to build. Two workarounds, in order of preference:
+
+1. **Skip Homebrew and use `pymobiledevice3`.** It's pip-installable,
+   actively maintained, and this tool auto-detects it:
+
+   ```
+   python3 -m pip install --user pymobiledevice3
+   python3 textdownload.py --via-usb --phone 5551234567
+   ```
+
+2. **Try the HEAD build** if you still want the Homebrew route:
+
+   ```
+   brew install --HEAD libimobiledevice
+   ```
+
+Both drivers speak the same iOS backup protocol; the tool works with
+either one.
 
 ## Notes and limits
 

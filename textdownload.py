@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import plistlib
 import re
@@ -503,37 +504,78 @@ class BackupAttachmentResolver:
         return None
 
 
-# --- USB-triggered backup via libimobiledevice --------------------------
+# --- USB-triggered backup ------------------------------------------------
 
 # iOS does NOT expose sms.db over USB in any way except through the
-# backup service (com.apple.mobilebackup2). libimobiledevice's
-# `idevicebackup2` command speaks that same protocol, so we can trigger
-# a backup from the CLI without opening Finder and point it at whatever
-# directory we like — a session-scoped temp dir (backup discarded after
-# reading sms.db) or a persistent cache dir (subsequent runs are
-# incremental and pull only changed files).
+# backup service (com.apple.mobilebackup2). Two mature CLIs speak that
+# protocol from a Mac: libimobiledevice's `idevicebackup2` (Homebrew)
+# and `pymobiledevice3` (pip). We probe for either. pymobiledevice3 is
+# preferred because it's a straight `pip install` and stays current
+# with new iOS releases; the Homebrew formula frequently lags.
 
 DEFAULT_USB_CACHE = Path.home() / ".cache" / "textdownloadmac" / "backup"
 
+_INSTALL_HINT = (
+    "No iOS backup driver found on PATH. Install one of:\n"
+    "  Option A — pip (no Homebrew required, actively maintained):\n"
+    "      python3 -m pip install --user pymobiledevice3\n"
+    "  Option B — Homebrew:\n"
+    "      brew install libimobiledevice\n"
+    "    If the stable formula fails to build on your macOS, try HEAD:\n"
+    "      brew install --HEAD libimobiledevice\n"
+    "    or grab a maintained tap:\n"
+    "      brew tap libimobiledevice-glue/libimobiledevice-glue\n"
+    "      brew install --HEAD libimobiledevice\n"
+    "Then rerun with --via-usb."
+)
 
-def libimobiledevice_error() -> Optional[str]:
-    """Return None if idevicebackup2 is available, else an error string."""
-    if shutil.which("idevicebackup2") is None:
-        return (
-            "idevicebackup2 is not installed. Install libimobiledevice:\n"
-            "    brew install libimobiledevice\n"
-            "then rerun with --via-usb."
-        )
-    if shutil.which("idevice_id") is None:
-        return (
-            "idevice_id is not on PATH — libimobiledevice seems partially\n"
-            "installed. Try:  brew reinstall libimobiledevice"
-        )
+
+def find_backup_driver() -> Optional[str]:
+    """Return the name of the first backup CLI found on PATH, else None."""
+    if shutil.which("pymobiledevice3"):
+        return "pymobiledevice3"
+    if shutil.which("idevicebackup2"):
+        return "idevicebackup2"
     return None
 
 
-def connected_iphone_udid() -> Optional[str]:
-    """Return the UDID of a USB-attached iPhone, if any is paired and awake."""
+def libimobiledevice_error() -> Optional[str]:
+    """Return None if a backup driver is available, else the install hint."""
+    return None if find_backup_driver() is not None else _INSTALL_HINT
+
+
+def _udid_from_pymobiledevice3() -> Optional[str]:
+    try:
+        p = subprocess.run(
+            ["pymobiledevice3", "usbmux", "list"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0 or not p.stdout.strip():
+        return None
+    try:
+        data = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        m = re.search(
+            r"(?:Identifier|UDID|SerialNumber)[^A-Za-z0-9-]+([A-Za-z0-9-]{20,})",
+            p.stdout,
+        )
+        return m.group(1) if m else None
+    if isinstance(data, list) and data:
+        first = data[0]
+        if isinstance(first, dict):
+            for key in ("Identifier", "SerialNumber", "UDID", "udid"):
+                if key in first and first[key]:
+                    return str(first[key])
+    return None
+
+
+def _udid_from_idevice_id() -> Optional[str]:
+    if shutil.which("idevice_id") is None:
+        return None
     try:
         p = subprocess.run(
             ["idevice_id", "-l"],
@@ -549,24 +591,47 @@ def connected_iphone_udid() -> Optional[str]:
     return lines[0] if lines else None
 
 
-def run_usb_backup(target_root: Path, udid: Optional[str]) -> Path:
-    """Trigger `idevicebackup2 backup` into target_root and return the
-    backup's <UDID>/ subdirectory.
+def connected_iphone_udid() -> Optional[str]:
+    """Return the UDID of a USB-attached iPhone via whichever driver is present."""
+    driver = find_backup_driver()
+    if driver == "pymobiledevice3":
+        return _udid_from_pymobiledevice3() or _udid_from_idevice_id()
+    if driver == "idevicebackup2":
+        return _udid_from_idevice_id() or _udid_from_pymobiledevice3()
+    return None
 
-    target_root is passed to idevicebackup2 unchanged; the tool creates
-    (or reuses) target_root/<UDID>/ inside it. On the first backup this
-    pulls the entire phone; on subsequent runs against the same
-    target_root it's incremental.
-    """
-    target_root.mkdir(parents=True, exist_ok=True)
-    cmd = ["idevicebackup2", "backup"]
+
+def _build_backup_command(
+    driver: str, target_root: Path, udid: Optional[str]
+) -> list[str]:
+    if driver == "idevicebackup2":
+        cmd = ["idevicebackup2", "backup"]
+        if udid:
+            cmd += ["--udid", udid]
+        cmd.append(str(target_root))
+        return cmd
+    # pymobiledevice3
+    cmd = ["pymobiledevice3", "backup2", "backup"]
     if udid:
         cmd += ["--udid", udid]
     cmd.append(str(target_root))
-    print(
-        "Running: " + " ".join(cmd),
-        file=sys.stderr,
-    )
+    return cmd
+
+
+def run_usb_backup(target_root: Path, udid: Optional[str]) -> Path:
+    """Trigger an iOS backup into target_root and return the backup's
+    <UDID>/ subdirectory.
+
+    Uses whichever backup driver is on PATH. On the first backup this
+    pulls the entire phone; on subsequent runs against the same
+    target_root the driver does an incremental transfer.
+    """
+    driver = find_backup_driver()
+    if driver is None:
+        raise RuntimeError(_INSTALL_HINT)
+    target_root.mkdir(parents=True, exist_ok=True)
+    cmd = _build_backup_command(driver, target_root, udid)
+    print("Running: " + " ".join(cmd), file=sys.stderr)
     print(
         "  (First backup pulls the entire phone — this can take a while. "
         "Subsequent runs against the same directory are incremental.)",
@@ -575,11 +640,10 @@ def run_usb_backup(target_root: Path, udid: Optional[str]) -> Path:
     result = subprocess.run(cmd)
     if result.returncode != 0:
         raise RuntimeError(
-            f"idevicebackup2 exited with status {result.returncode}. "
+            f"{driver} exited with status {result.returncode}. "
             "Common causes: the phone is locked, 'Trust This Computer' "
             "hasn't been tapped, or backup encryption is enabled on the "
-            "phone (turn it off in Finder or accept an encrypted backup "
-            "that this tool cannot decrypt)."
+            "phone (which this tool cannot decrypt)."
         )
     candidates = [
         d for d in target_root.iterdir()

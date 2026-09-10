@@ -1,4 +1,10 @@
 reportlab>=4.0
+
 # Optional: enable inline rendering of HEIC images from newer iPhones.
 # pillow>=10.0
 # pillow-heif>=0.13
+
+# Optional: enables --via-usb without needing Homebrew. Actively
+# maintained; works with current iOS versions. If this is installed the
+# tool uses it in preference to libimobiledevice's idevicebackup2.
+# pymobiledevice3>=4.0
