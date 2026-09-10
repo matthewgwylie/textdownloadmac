@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-textdownload — Export Messages conversations with a contact to a PDF.
+textdownload — Export iPhone Messages conversations with a contact to a PDF.
 
-Reads the Mac's local Messages database (~/Library/Messages/chat.db),
-which stores iMessage and SMS threads synced from your iPhone. When
-your iPhone is USB-attached and Messages on the Mac is signed in with
-the same Apple ID (or SMS Forwarding is enabled), the conversation
-history is already present here — no separate backup step needed.
+Two sources are supported and the tool auto-picks between them:
+
+  1. The Mac's live Messages database (~/Library/Messages/chat.db).
+     Useful when Messages on the Mac is signed in with the same Apple ID
+     as the iPhone (or SMS Forwarding is on) so the threads are already
+     mirrored there.
+
+  2. An iPhone backup made by Finder while the phone is USB-attached
+     (~/Library/Application Support/MobileSync/Backup/<UDID>/). This is
+     the fallback when the phone is only plugged in and NOT synced to
+     the Mac. The tool locates the latest local backup, reads its
+     Manifest.db, extracts sms.db (and pulls image attachments out of
+     the backup on demand).
+
+Default behavior: try the Mac database; if no messages match the
+contact, automatically fall back to the latest local iPhone backup.
 
 The exported PDF contains:
   - A "Direct Conversation" section with the 1:1 thread(s) for the number.
@@ -15,22 +26,31 @@ The exported PDF contains:
     in the section header. Every message in a group section is labeled
     with the sender's handle.
 
+Phone-number matching is loose: 555-123-4567, (555) 123-4567 and
++15551234567 all resolve to the same contact via last-10-digit match.
+
 Usage:
     python3 textdownload.py                           # prompts for the number
     python3 textdownload.py --phone +15551234567
-    python3 textdownload.py --phone 555-123-4567 --output thread.pdf
+    python3 textdownload.py --phone 5551234567 --output thread.pdf
+    python3 textdownload.py --list-backups            # show phones you've backed up
+    python3 textdownload.py --use-backup --phone ...  # force reading from backup
 
-macOS permissions:
-    Reading chat.db requires Full Disk Access for the terminal running
-    this script (System Settings -> Privacy & Security -> Full Disk
-    Access). If you see "operation not permitted", grant access there
-    and retry.
+Reading chat.db requires Full Disk Access for the terminal running
+this script (System Settings -> Privacy & Security -> Full Disk Access).
+Reading iPhone backups does not.
+
+Encrypted iPhone backups are detected but not decrypted here. If your
+backup is encrypted, uncheck "Encrypt local backup" in Finder and make
+a fresh backup, then re-run.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import plistlib
 import re
 import shutil
 import sqlite3
@@ -38,7 +58,7 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     from reportlab.lib.colors import HexColor
@@ -63,7 +83,16 @@ except ImportError:
 
 
 DEFAULT_DB = Path.home() / "Library" / "Messages" / "chat.db"
+DEFAULT_BACKUP_ROOT = (
+    Path.home() / "Library" / "Application Support" / "MobileSync" / "Backup"
+)
 COCOA_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+# A "resolve attachment" function maps the raw attachment.filename value
+# from the messages database to a local file we can embed in the PDF, or
+# None if that file isn't available. Different sources (live Mac vs iOS
+# backup) supply different resolvers.
+AttachmentResolver = Callable[[Optional[str]], Optional[Path]]
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff"}
 HEIC_EXTS = {".heic", ".heif"}
@@ -262,11 +291,209 @@ def fetch_attachments(conn: sqlite3.Connection, msg_id: int) -> list[dict]:
 
 
 def resolve_attachment_path(filename: Optional[str]) -> Optional[Path]:
+    """Attachment resolver for the live Mac chat.db: expand ~ and return
+    the local path if the file is still on disk."""
     if not filename:
         return None
     expanded = os.path.expanduser(filename)
     p = Path(expanded)
     return p if p.exists() else None
+
+
+# --- iPhone backup support ----------------------------------------------
+
+def ios_backup_hash(domain: str, relative_path: str) -> str:
+    """Compute the fileID hash iOS uses to name a file in a Finder backup."""
+    return hashlib.sha1(f"{domain}-{relative_path}".encode("utf-8")).hexdigest()
+
+
+def _read_backup_metadata(backup_dir: Path) -> dict:
+    info: dict = {
+        "udid": backup_dir.name,
+        "path": backup_dir,
+        "device_name": backup_dir.name,
+        "encrypted": False,
+        "last_modified": datetime.fromtimestamp(
+            backup_dir.stat().st_mtime, tz=timezone.utc
+        ),
+    }
+    # Manifest.plist has IsEncrypted + Date + Lockdown{DeviceName};
+    # Info.plist (older) has "Device Name" and "Last Backup Date".
+    for name in ("Manifest.plist", "Info.plist"):
+        plist_path = backup_dir / name
+        if not plist_path.exists():
+            continue
+        try:
+            with open(plist_path, "rb") as f:
+                meta = plistlib.load(f)
+        except Exception:
+            continue
+        if "IsEncrypted" in meta:
+            info["encrypted"] = bool(meta["IsEncrypted"])
+        if isinstance(meta.get("Date"), datetime):
+            info["last_modified"] = meta["Date"]
+        if isinstance(meta.get("Lockdown"), dict):
+            dn = meta["Lockdown"].get("DeviceName")
+            if dn:
+                info["device_name"] = dn
+        if isinstance(meta.get("Device Name"), str):
+            info["device_name"] = meta["Device Name"]
+        if isinstance(meta.get("Last Backup Date"), datetime):
+            info["last_modified"] = meta["Last Backup Date"]
+    return info
+
+
+def list_ios_backups(root: Optional[Path] = None) -> list[dict]:
+    """Enumerate iPhone/iPad backups under ~/Library/.../MobileSync/Backup."""
+    root = root or DEFAULT_BACKUP_ROOT
+    if not root.exists():
+        return []
+    out: list[dict] = []
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        # A real backup has Manifest.db or Manifest.plist.
+        if not (entry / "Manifest.plist").exists() and not (entry / "Manifest.db").exists():
+            continue
+        out.append(_read_backup_metadata(entry))
+    out.sort(key=lambda x: x["last_modified"], reverse=True)
+    return out
+
+
+def find_latest_ios_backup(root: Optional[Path] = None) -> Optional[dict]:
+    backups = list_ios_backups(root)
+    return backups[0] if backups else None
+
+
+def _open_backup_manifest(backup_dir: Path) -> sqlite3.Connection:
+    manifest_db = backup_dir / "Manifest.db"
+    if not manifest_db.exists():
+        raise FileNotFoundError(
+            f"No Manifest.db in {backup_dir}. If Manifest.plist reports "
+            "IsEncrypted=true the backup is password-protected and cannot "
+            "be read directly."
+        )
+    return sqlite3.connect(str(manifest_db))
+
+
+def _backup_file_id(
+    manifest: sqlite3.Connection, domain: str, relative_path: str
+) -> Optional[str]:
+    cur = manifest.cursor()
+    cur.execute(
+        "SELECT fileID FROM Files WHERE domain = ? AND relativePath = ?",
+        (domain, relative_path),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _backup_file_path(backup_dir: Path, file_id: str) -> Path:
+    return backup_dir / file_id[:2] / file_id
+
+
+def extract_sms_db_from_backup(backup_dir: Path, tmpdir: Path) -> Path:
+    """Copy sms.db (and its WAL/SHM sidecars, if any) out of an iOS backup."""
+    manifest = _open_backup_manifest(backup_dir)
+    try:
+        sms_id = _backup_file_id(manifest, "HomeDomain", "Library/SMS/sms.db")
+        if not sms_id:
+            raise FileNotFoundError(
+                "The backup at "
+                f"{backup_dir} does not list Library/SMS/sms.db. Make sure "
+                "the backup finished and included the phone's messages."
+            )
+        src = _backup_file_path(backup_dir, sms_id)
+        if not src.exists():
+            raise FileNotFoundError(
+                f"Backup index points at {src} but the file is missing "
+                "— the backup is incomplete or encrypted."
+            )
+        dest = tmpdir / "chat.db"
+        shutil.copy2(src, dest)
+        for suffix, rel in (
+            ("-wal", "Library/SMS/sms.db-wal"),
+            ("-shm", "Library/SMS/sms.db-shm"),
+        ):
+            side_id = _backup_file_id(manifest, "HomeDomain", rel)
+            if side_id:
+                side_src = _backup_file_path(backup_dir, side_id)
+                if side_src.exists():
+                    try:
+                        shutil.copy2(side_src, tmpdir / f"chat.db{suffix}")
+                    except OSError:
+                        pass
+        return dest
+    finally:
+        manifest.close()
+
+
+class BackupAttachmentResolver:
+    """Attachment resolver for an iPhone backup.
+
+    Given an ``attachment.filename`` value from sms.db (an iOS-side path
+    like ``~/Library/SMS/Attachments/.../IMG_0001.jpg``), look the file
+    up in Manifest.db, copy it out of the backup on first use, and
+    return the local path. Results are cached so a repeat attachment
+    isn't re-copied. This is a callable so it drops into the same slot
+    as ``resolve_attachment_path``.
+    """
+
+    def __init__(self, backup_dir: Path, tmpdir: Path):
+        self.backup_dir = backup_dir
+        self.dest_root = tmpdir / "backup_attachments"
+        self.dest_root.mkdir(exist_ok=True)
+        self.manifest = _open_backup_manifest(backup_dir)
+        self._cache: dict[str, Optional[Path]] = {}
+
+    def close(self) -> None:
+        try:
+            self.manifest.close()
+        except Exception:
+            pass
+
+    def __call__(self, filename: Optional[str]) -> Optional[Path]:
+        if not filename:
+            return None
+        if filename in self._cache:
+            return self._cache[filename]
+        rel = filename
+        if rel.startswith("~/"):
+            rel = rel[2:]
+        # SMS attachments live under MediaDomain on modern iOS; older
+        # backups sometimes carry them under HomeDomain. Try both, and
+        # try with and without a leading "Library/" segment because
+        # relativePath in Manifest.db is stored without the "~/".
+        candidates: list[tuple[str, str]] = [
+            ("MediaDomain", rel),
+            ("HomeDomain", rel),
+        ]
+        if rel.startswith("Library/"):
+            trimmed = rel[len("Library/") :]
+            candidates.append(("MediaDomain", trimmed))
+            candidates.append(("HomeDomain", trimmed))
+        for domain, path in candidates:
+            file_id = _backup_file_id(self.manifest, domain, path)
+            if not file_id:
+                continue
+            src = _backup_file_path(self.backup_dir, file_id)
+            if not src.exists():
+                continue
+            ext = Path(filename).suffix
+            dest = self.dest_root / (file_id + ext)
+            if not dest.exists():
+                try:
+                    shutil.copy2(src, dest)
+                except OSError:
+                    continue
+            self._cache[filename] = dest
+            return dest
+        self._cache[filename] = None
+        return None
+
+
+# --- end iPhone backup support ------------------------------------------
+
 
 
 def convert_heic_to_jpeg(src: Path, tmpdir: Path) -> Optional[Path]:
@@ -422,6 +649,7 @@ def _render_message(
     image_max_h: float,
     show_sender: bool,
     fallback_sender: str,
+    resolve_attachment: AttachmentResolver,
 ) -> KeepTogether:
     stamp = format_stamp(msg["when"])
     who = "Me" if msg["from_me"] else (msg["sender"] or fallback_sender)
@@ -443,7 +671,7 @@ def _render_message(
         block.append(Paragraph(text_html, body_style))
     attachments = fetch_attachments(conn, msg["id"])
     for att in attachments:
-        path = resolve_attachment_path(att["filename"])
+        path = resolve_attachment(att["filename"])
         if path and is_image(att["mime"], path):
             img = flowable_image(path, tmpdir, image_max_w, image_max_h)
             if img is not None:
@@ -471,6 +699,8 @@ def build_pdf(
     direct_messages: list[dict],
     group_sections: list[dict],
     output: Path,
+    resolve_attachment: AttachmentResolver,
+    source_label: str = "",
 ) -> None:
     """Write the PDF.
 
@@ -497,12 +727,14 @@ def build_pdf(
     story: list = []
     story.append(Paragraph(f"Messages with {escape_html(contact)}", styles["title"]))
     generated = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
-    subtitle = (
-        f"Exported {escape_html(generated)} &middot; "
-        f"{total_msgs} message(s) &middot; "
-        f"1 direct thread, {len(group_sections)} group thread(s)"
-    )
-    story.append(Paragraph(subtitle, styles["subtitle"]))
+    subtitle_parts = [
+        f"Exported {escape_html(generated)}",
+        f"{total_msgs} message(s)",
+        f"1 direct thread, {len(group_sections)} group thread(s)",
+    ]
+    if source_label:
+        subtitle_parts.append(f"Source: {escape_html(source_label)}")
+    story.append(Paragraph(" &middot; ".join(subtitle_parts), styles["subtitle"]))
 
     with tempfile.TemporaryDirectory(prefix="textdownload_") as tmp:
         tmpdir = Path(tmp)
@@ -537,6 +769,7 @@ def build_pdf(
                         image_max_h,
                         show_sender=False,
                         fallback_sender=contact,
+                        resolve_attachment=resolve_attachment,
                     )
                 )
 
@@ -570,6 +803,7 @@ def build_pdf(
                         image_max_h,
                         show_sender=True,
                         fallback_sender=contact,
+                        resolve_attachment=resolve_attachment,
                     )
                 )
 
@@ -669,16 +903,105 @@ def partition_chats(
     return direct_messages, group_sections
 
 
+def _sample_handles(conn: sqlite3.Connection, limit: int = 12) -> list[str]:
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM handle ORDER BY ROWID LIMIT ?", (limit,))
+    return [r[0] for r in cur.fetchall() if r[0]]
+
+
+def _count_handles(conn: sqlite3.Connection) -> int:
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM handle")
+    return cur.fetchone()[0]
+
+
+def _open_source_from_mac(
+    db_path: Path, tmpdir: Path
+) -> tuple[sqlite3.Connection, AttachmentResolver, str, Optional[BackupAttachmentResolver]]:
+    """Return (conn, resolver, source_label, backup_resolver)."""
+    mac_dir = tmpdir / "mac"
+    mac_dir.mkdir(exist_ok=True)
+    snapshot = snapshot_database(db_path, mac_dir)
+    conn = open_snapshot(snapshot)
+    return conn, resolve_attachment_path, f"Mac Messages DB ({db_path})", None
+
+
+def _open_source_from_backup(
+    backup: dict, tmpdir: Path
+) -> tuple[sqlite3.Connection, AttachmentResolver, str, BackupAttachmentResolver]:
+    backup_dir: Path = backup["path"]
+    dest = tmpdir / f"backup_{backup_dir.name}"
+    dest.mkdir(exist_ok=True)
+    snapshot = extract_sms_db_from_backup(backup_dir, dest)
+    conn = open_snapshot(snapshot)
+    resolver = BackupAttachmentResolver(backup_dir, dest)
+    when = backup["last_modified"].astimezone().strftime("%Y-%m-%d %H:%M")
+    label = f"iPhone backup: {backup['device_name']} @ {when}"
+    return conn, resolver, label, resolver
+
+
+def _print_no_match_hints(
+    conn: sqlite3.Connection, phone: str, source_label: str
+) -> None:
+    total = _count_handles(conn)
+    sample = _sample_handles(conn)
+    print(
+        f"No matching handle for '{phone}' in {source_label}.",
+        file=sys.stderr,
+    )
+    print(
+        f"  This source contains {total} handle(s). "
+        "Loose matching already tries the number in +country-code and "
+        "10-digit forms.",
+        file=sys.stderr,
+    )
+    if sample:
+        print("  Sample of handles present in this source:", file=sys.stderr)
+        for h in sample:
+            print(f"    {h}", file=sys.stderr)
+    if total == 0:
+        print(
+            "  The source is empty. If your phone isn't synced to this Mac's "
+            "Messages app, take a Finder backup of your USB-attached phone "
+            "and try again (open Finder -> device -> General -> Back Up Now, "
+            "with 'Encrypt local backup' UNCHECKED).",
+            file=sys.stderr,
+        )
+
+
+def _do_list_backups() -> int:
+    backups = list_ios_backups()
+    if not backups:
+        print(
+            f"No iPhone backups found under {DEFAULT_BACKUP_ROOT}.\n"
+            "In Finder, select your USB-attached iPhone, then click "
+            "'Back Up Now' (uncheck 'Encrypt local backup' to keep it "
+            "readable). Re-run --list-backups afterward.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"iPhone/iPad backups under {DEFAULT_BACKUP_ROOT}:")
+    for b in backups:
+        when = b["last_modified"].astimezone().strftime("%Y-%m-%d %H:%M")
+        enc = "encrypted" if b["encrypted"] else "unencrypted"
+        print(f"  {when}  {b['device_name']}  [{enc}]  {b['path']}")
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Export Messages conversations (direct thread + group threads) "
-            "with a given phone number to PDF."
+            "with a given phone number to PDF. Reads the Mac's Messages "
+            "database by default and automatically falls back to the latest "
+            "local iPhone Finder backup if the Mac has no matching thread."
         ),
     )
     parser.add_argument(
         "--phone",
-        help="Phone number to export (e.g. +15551234567). Prompted if omitted.",
+        help="Phone number to export (e.g. +15551234567). Prompted if omitted. "
+             "Formatted numbers like 555-123-4567 also work; a leading +1 is "
+             "added automatically when matching.",
     )
     parser.add_argument(
         "--output",
@@ -689,58 +1012,165 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--db",
         type=Path,
         default=DEFAULT_DB,
-        help=f"Path to chat.db (default: {DEFAULT_DB}).",
+        help=f"Path to Mac chat.db (default: {DEFAULT_DB}).",
+    )
+    parser.add_argument(
+        "--backup-path",
+        type=Path,
+        help="Path to a specific iPhone backup directory (skips the Mac DB).",
+    )
+    parser.add_argument(
+        "--use-backup",
+        action="store_true",
+        help="Read from the latest local iPhone backup instead of the Mac DB.",
+    )
+    parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="Do NOT fall back to the iPhone backup if the Mac DB has no match.",
+    )
+    parser.add_argument(
+        "--list-backups",
+        action="store_true",
+        help="List iPhone backups this Mac has and exit.",
     )
     args = parser.parse_args(argv)
+
+    if args.list_backups:
+        return _do_list_backups()
 
     phone = args.phone or prompt_for_phone()
     if not phone:
         print("No phone number provided.", file=sys.stderr)
         return 2
 
-    if not args.db.exists():
-        print(f"Messages database not found at {args.db}.", file=sys.stderr)
-        print(
-            "On macOS this is normally ~/Library/Messages/chat.db and requires "
-            "Full Disk Access for your terminal.",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Work on a snapshot so a locked, live database doesn't block us.
-    with tempfile.TemporaryDirectory(prefix="textdownload_db_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="textdownload_") as tmp:
         tmpdir = Path(tmp)
-        try:
-            snapshot = snapshot_database(args.db, tmpdir)
-        except PermissionError:
-            print(
-                "Permission denied reading the Messages database.\n"
-                "Grant Full Disk Access to your terminal in "
-                "System Settings -> Privacy & Security, then retry.",
-                file=sys.stderr,
-            )
-            return 1
+        backup_resolver: Optional[BackupAttachmentResolver] = None
+        conn: Optional[sqlite3.Connection] = None
+        source_label = ""
+        resolve_attachment: AttachmentResolver = resolve_attachment_path
 
         try:
-            conn = open_snapshot(snapshot)
-        except sqlite3.OperationalError as e:
-            print(
-                f"Could not open the Messages database ({e}).\n"
-                f"Snapshot: {snapshot} "
-                f"(size: {snapshot.stat().st_size if snapshot.exists() else '?'} bytes)\n"
-                "If the source database is on an external / network volume, "
-                "copy it to a local disk first and pass it with --db.",
-                file=sys.stderr,
-            )
-            return 1
-        try:
+            # -------- Decide the initial source --------
+            if args.backup_path:
+                backup_dir = args.backup_path
+                if not backup_dir.exists():
+                    print(f"Backup path does not exist: {backup_dir}", file=sys.stderr)
+                    return 1
+                info = _read_backup_metadata(backup_dir)
+                if info["encrypted"]:
+                    print(
+                        f"Backup at {backup_dir} is encrypted; textdownload "
+                        "cannot read encrypted backups. In Finder, uncheck "
+                        "'Encrypt local backup' and take a fresh backup.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                conn, resolve_attachment, source_label, backup_resolver = (
+                    _open_source_from_backup(info, tmpdir)
+                )
+            elif args.use_backup:
+                latest = find_latest_ios_backup()
+                if latest is None:
+                    print(
+                        f"No iPhone backups found under {DEFAULT_BACKUP_ROOT}. "
+                        "Take a Finder backup of your USB-attached phone first.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if latest["encrypted"]:
+                    print(
+                        f"Latest backup ({latest['device_name']}) is encrypted; "
+                        "textdownload cannot read encrypted backups. In Finder, "
+                        "uncheck 'Encrypt local backup' and take a fresh backup.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                conn, resolve_attachment, source_label, backup_resolver = (
+                    _open_source_from_backup(latest, tmpdir)
+                )
+            else:
+                # Try Mac chat.db first.
+                if not args.db.exists():
+                    print(
+                        f"Mac Messages database not found at {args.db}.",
+                        file=sys.stderr,
+                    )
+                    if not args.no_backup:
+                        print(
+                            "Will try the latest iPhone backup instead...",
+                            file=sys.stderr,
+                        )
+                        latest = find_latest_ios_backup()
+                        if latest is None or latest["encrypted"]:
+                            reason = (
+                                "no backups found" if latest is None
+                                else "the latest backup is encrypted"
+                            )
+                            print(
+                                f"No usable source: {reason}. Take a Finder "
+                                "backup with 'Encrypt local backup' UNCHECKED.",
+                                file=sys.stderr,
+                            )
+                            return 1
+                        conn, resolve_attachment, source_label, backup_resolver = (
+                            _open_source_from_backup(latest, tmpdir)
+                        )
+                    else:
+                        return 1
+                else:
+                    try:
+                        conn, resolve_attachment, source_label, backup_resolver = (
+                            _open_source_from_mac(args.db, tmpdir)
+                        )
+                    except PermissionError:
+                        print(
+                            "Permission denied reading the Mac Messages "
+                            "database. Grant Full Disk Access to your terminal "
+                            "in System Settings -> Privacy & Security, or use "
+                            "--use-backup to read the iPhone backup instead.",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    except sqlite3.OperationalError as e:
+                        print(
+                            f"Could not open the Mac Messages database ({e}).",
+                            file=sys.stderr,
+                        )
+                        return 1
+
             handle_ids = find_handle_ids(conn, phone)
-            if not handle_ids:
+
+            # -------- Fall back to backup if Mac had no match --------
+            if not handle_ids and not args.no_backup and backup_resolver is None:
                 print(
-                    f"No conversation found for '{phone}'. "
-                    "Try the number in +country-code format (e.g. +15551234567).",
+                    f"No matching handle for '{phone}' in the Mac Messages "
+                    "database; trying the latest iPhone backup...",
                     file=sys.stderr,
                 )
+                latest = find_latest_ios_backup()
+                if latest is None:
+                    _print_no_match_hints(conn, phone, source_label)
+                    return 1
+                if latest["encrypted"]:
+                    _print_no_match_hints(conn, phone, source_label)
+                    print(
+                        f"  (An iPhone backup exists — {latest['device_name']} "
+                        f"@ {latest['last_modified']:%Y-%m-%d %H:%M} — but it "
+                        "is encrypted. Uncheck 'Encrypt local backup' in "
+                        "Finder and take a fresh backup.)",
+                        file=sys.stderr,
+                    )
+                    return 1
+                conn.close()
+                conn, resolve_attachment, source_label, backup_resolver = (
+                    _open_source_from_backup(latest, tmpdir)
+                )
+                handle_ids = find_handle_ids(conn, phone)
+
+            if not handle_ids:
+                _print_no_match_hints(conn, phone, source_label)
                 return 1
 
             direct_messages, group_sections = partition_chats(
@@ -750,7 +1180,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 len(g["messages"]) for g in group_sections
             )
             if total == 0:
-                print(f"No messages found with {phone}.", file=sys.stderr)
+                print(
+                    f"Handle for {phone} exists in {source_label} but there "
+                    "are no messages associated with it.",
+                    file=sys.stderr,
+                )
                 return 1
 
             if args.output:
@@ -760,15 +1194,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 output = Path.cwd() / f"messages_{safe_phone}_{stamp}.pdf"
 
-            build_pdf(conn, phone, direct_messages, group_sections, output)
+            build_pdf(
+                conn,
+                phone,
+                direct_messages,
+                group_sections,
+                output,
+                resolve_attachment=resolve_attachment,
+                source_label=source_label,
+            )
             print(
                 f"Wrote {total} message(s) "
                 f"({len(direct_messages)} direct, "
                 f"{len(group_sections)} group thread(s)) to {output}",
                 file=sys.stdout,
             )
+            print(f"Source: {source_label}", file=sys.stdout)
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
+            if backup_resolver is not None:
+                backup_resolver.close()
     return 0
 
 

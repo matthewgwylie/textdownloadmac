@@ -1,21 +1,33 @@
 # textdownloadmac
 
-Simple macOS command-line tool for exporting Messages (iMessage + SMS)
-conversations with a given phone number to a PDF, with datetime stamps
-and inline images. Both the direct 1:1 thread and every group chat
-that includes the number are included, each in its own section.
+Simple macOS command-line tool for exporting iPhone Messages (iMessage +
+SMS) conversations with a given phone number to a PDF, with datetime
+stamps and inline images. Both the direct 1:1 thread and every group
+chat that includes the number are included, each in its own section.
 
-## How it works
+## Sources it can read
 
-macOS keeps a local copy of your Messages threads at
-`~/Library/Messages/chat.db`. When your iPhone is USB-attached and Messages
-on the Mac is signed in with the same Apple ID (or SMS Forwarding is on),
-your text history — iMessage and SMS — is already there.
-`textdownload.py` reads that database read-only (via a temporary snapshot,
-so a live/locked DB isn't a problem), pulls every message with the
-requested contact plus their attachments, and lays them out in a PDF with:
+The tool understands two sources and picks between them automatically:
 
-- A **Direct Conversation** section combining all 1:1 threads with the
+1. **Mac's live Messages database** at `~/Library/Messages/chat.db`.
+   Works when Messages on the Mac is signed in with the same Apple ID
+   as your iPhone (or SMS Forwarding is on) so threads are mirrored
+   there. Requires **Full Disk Access** for your terminal.
+
+2. **iPhone Finder backup** at
+   `~/Library/Application Support/MobileSync/Backup/<UDID>/`.
+   Used when the phone is only USB-plugged into the Mac and NOT signed
+   in to the same Messages account. The tool reads `Manifest.db`,
+   extracts `sms.db`, and pulls image attachments out of the backup on
+   demand. Does not require Full Disk Access.
+
+**Default flow:** try the Mac database first; if it has no matching
+handle for the requested number, automatically fall back to the latest
+local iPhone backup.
+
+The exported PDF contains:
+
+- A **Direct Conversation** section combining any 1:1 threads with the
   contact.
 - A separate section for **each group chat** that includes the contact,
   headed by the display name (or "Group Conversation") and a line
@@ -27,11 +39,26 @@ requested contact plus their attachments, and lays them out in a PDF with:
 - Inline images (JPEG/PNG/GIF; HEIC too if Pillow + pillow-heif are
   installed).
 - A `[Attachment: name · mime]` note for non-image attachments.
+- A "Source: ..." footer noting which database the export came from.
+
+## Phone-number matching
+
+Numbers are matched loosely — you don't need to guess the format the
+database uses:
+
+- Exact E.164 match (`+15551234567`)
+- Last-10-digit match, so `5551234567`, `555-123-4567`, `(555) 123-4567`
+  and `+15551234567` all resolve to the same contact.
+
+That means giving the tool a bare 10-digit number is enough; it will
+still find a stored handle recorded as `+15551234567`.
 
 ## Requirements
 
-- macOS with Messages set up for the same Apple ID as your USB-attached
-  iPhone (or SMS Forwarding enabled from the phone)
+- macOS with either:
+  - Messages set up for the same Apple ID as your iPhone (SMS
+    Forwarding is fine), **or**
+  - A local Finder backup of the iPhone (below).
 - Python 3.9+
 - `reportlab` (required) and optionally `pillow` + `pillow-heif` for HEIC
   images
@@ -42,48 +69,90 @@ Install dependencies:
 python3 -m pip install --user -r requirements.txt
 ```
 
-## Granting Full Disk Access
+## Making a Finder backup of a USB-attached iPhone
 
-Reading `~/Library/Messages/chat.db` requires **Full Disk Access** on
-modern macOS.
+If your phone is not synced to this Mac's Messages, take a backup:
+
+1. Plug the iPhone into the Mac. On the phone, tap **Trust This
+   Computer** if prompted, and enter your passcode.
+2. Open **Finder**. Select the iPhone in the sidebar.
+3. Under **General → Backups**, choose **Back up all of the data on
+   your iPhone to this Mac**.
+4. **Uncheck "Encrypt local backup"** — textdownloadmac cannot read
+   encrypted backups.
+5. Click **Back Up Now** and wait for it to finish.
+
+The backup lands in
+`~/Library/Application Support/MobileSync/Backup/<UDID>/`.
+
+> If you have previously enabled encryption and no longer know the
+> password, iOS won't let you turn encryption off without setting a new
+> password. Set a new one you know, uncheck the box, and take a fresh
+> unencrypted backup — the old encrypted one is not needed.
+
+Optional: you can also automate backups with `libimobiledevice`
+(`brew install libimobiledevice`) and `idevicebackup2 backup <dir>`.
+
+## Granting Full Disk Access (only needed for the Mac source)
+
+Reading `~/Library/Messages/chat.db` requires **Full Disk Access**.
 
 1. Open **System Settings → Privacy & Security → Full Disk Access**.
 2. Click **+** and add the terminal app you use to run the script
    (e.g. Terminal, iTerm, or your IDE).
 3. Quit and reopen the terminal.
 
-Without this permission you will see `operation not permitted` when the
-script tries to snapshot `chat.db`.
+Without this permission you'll see `operation not permitted` when the
+script tries to snapshot `chat.db`. Reading from an iPhone backup does
+NOT require this.
 
 ## Usage
 
 ```
-# Prompts for the number
+# Prompts for the number, tries Mac chat.db, falls back to latest backup
 python3 textdownload.py
 
-# Or pass it directly
+# Pass a number directly (any format)
 python3 textdownload.py --phone +15551234567
+python3 textdownload.py --phone 5551234567
+python3 textdownload.py --phone 555-123-4567
 
-# Custom output file
-python3 textdownload.py --phone 555-123-4567 --output thread.pdf
+# Force reading from the latest iPhone backup (skip Mac chat.db)
+python3 textdownload.py --use-backup --phone 5551234567
 
-# Point at a different chat.db (e.g. copied from another Mac)
-python3 textdownload.py --phone +15551234567 --db /path/to/chat.db
+# Read from a specific backup directory
+python3 textdownload.py --backup-path ~/Library/Application\ Support/MobileSync/Backup/<UDID> --phone 5551234567
+
+# Turn OFF backup fallback (Mac chat.db only)
+python3 textdownload.py --no-backup --phone 5551234567
+
+# List the backups this Mac has and exit
+python3 textdownload.py --list-backups
+
+# Custom output filename
+python3 textdownload.py --phone 5551234567 --output thread.pdf
 ```
-
-Numbers are matched loosely: exact E.164 (`+15551234567`), or a
-last-10-digit match for North American numbers, so `555-123-4567`,
-`(555) 123-4567`, and `+15551234567` all resolve to the same contact.
 
 The default output name is `messages_<phone>_<timestamp>.pdf` in the
 current working directory.
 
+## Diagnostics
+
+If the tool can't find a matching handle it prints:
+
+- Which source it looked at
+- How many handles that source has
+- A sample of the handles present
+
+That tells you whether the source is empty (typical: Mac chat.db when
+your phone isn't synced) versus the number genuinely differing from
+what's stored.
+
 ## Notes and limits
 
-- **Attachments live on disk.** The script only renders images whose
-  files are still present under `~/Library/Messages/Attachments/`. If
-  you've cleaned up old attachments, those messages will show a `(file
-  not found)` note instead of the image.
+- **Encrypted backups aren't decrypted.** The tool detects them and
+  points you at the fix (uncheck "Encrypt local backup" in Finder and
+  take a fresh backup).
 - **Attributed-body messages.** On Ventura and later some messages
   store text in `attributedBody` (an Apple typedstream blob) rather
   than `text`. There is a best-effort extractor for the common case;
@@ -91,5 +160,6 @@ current working directory.
   come through blank.
 - **Group participants** are listed by their raw handle (phone number
   in E.164 form, or email address) — Contacts app names aren't read.
-- **Read-only.** The script never writes to `chat.db`; it copies it to
-  a temp directory first and opens the copy in SQLite read-only mode.
+- **Read-only.** The script never writes to the source database; it
+  copies it into a temporary directory first and never modifies your
+  Mac Messages or your backup.
