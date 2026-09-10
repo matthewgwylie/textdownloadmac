@@ -583,10 +583,53 @@ def prompt_for_phone() -> str:
         return ""
 
 
-def open_readonly(db_path: Path) -> sqlite3.Connection:
-    """Open the Messages database read-only so we never mutate it."""
-    uri = f"file:{db_path}?mode=ro"
-    return sqlite3.connect(uri, uri=True)
+def snapshot_database(src: Path, dest_dir: Path) -> Path:
+    """Copy chat.db plus its WAL/SHM sidecars into a temp directory.
+
+    macOS's Messages database runs in WAL journal mode. Recent, still-
+    uncheckpointed commits live in chat.db-wal (with chat.db-shm as its
+    shared-memory index), so copying only the main file can leave the
+    snapshot un-openable — SQLite raises "unable to open database file"
+    if the WAL header points at a sidecar that isn't there. Copying the
+    sidecars along keeps the snapshot self-consistent.
+    """
+    dest = dest_dir / "chat.db"
+    shutil.copy2(src, dest)
+    for suffix in ("-wal", "-shm"):
+        sidecar = src.with_name(src.name + suffix)
+        if sidecar.exists():
+            try:
+                shutil.copy2(sidecar, dest_dir / (src.name + suffix))
+            except OSError:
+                # Sidecar missing or unreadable isn't fatal by itself; we'll
+                # still try to open the main file (and fall back to immutable
+                # mode if that fails).
+                pass
+    return dest
+
+
+def open_snapshot(db_path: Path) -> sqlite3.Connection:
+    """Open our local snapshot of chat.db.
+
+    Tries a plain connect first (works for the common case, and lets us
+    read the WAL sidecars we copied). Falls back to URI ``immutable=1``
+    if that raises CANTOPEN — that flag tells SQLite to treat the file
+    as a stand-alone read-only image and ignore WAL/SHM entirely, which
+    covers the case where only the main .db was recoverable.
+    """
+    try:
+        conn = sqlite3.connect(str(db_path))
+        # Force SQLite to actually open the file so we surface CANTOPEN
+        # here rather than at the first real query.
+        conn.execute("SELECT 1").fetchone()
+        return conn
+    except sqlite3.OperationalError:
+        pass
+    conn = sqlite3.connect(
+        f"file:{db_path}?mode=ro&immutable=1", uri=True
+    )
+    conn.execute("SELECT 1").fetchone()
+    return conn
 
 
 def partition_chats(
@@ -666,9 +709,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Work on a snapshot so a locked, live database doesn't block us.
     with tempfile.TemporaryDirectory(prefix="textdownload_db_") as tmp:
-        snapshot = Path(tmp) / "chat.db"
+        tmpdir = Path(tmp)
         try:
-            shutil.copy2(args.db, snapshot)
+            snapshot = snapshot_database(args.db, tmpdir)
         except PermissionError:
             print(
                 "Permission denied reading the Messages database.\n"
@@ -678,7 +721,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 1
 
-        conn = open_readonly(snapshot)
+        try:
+            conn = open_snapshot(snapshot)
+        except sqlite3.OperationalError as e:
+            print(
+                f"Could not open the Messages database ({e}).\n"
+                f"Snapshot: {snapshot} "
+                f"(size: {snapshot.stat().st_size if snapshot.exists() else '?'} bytes)\n"
+                "If the source database is on an external / network volume, "
+                "copy it to a local disk first and pass it with --db.",
+                file=sys.stderr,
+            )
+            return 1
         try:
             handle_ids = find_handle_ids(conn, phone)
             if not handle_ids:
