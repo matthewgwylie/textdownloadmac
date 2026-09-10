@@ -1,0 +1,4 @@
+reportlab>=4.0
+# Optional: enable inline rendering of HEIC images from newer iPhones.
+# pillow>=10.0
+# pillow-heif>=0.13
